@@ -1,0 +1,25 @@
+# Local secrets and credentials
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+demo-accounts.txt
+
+# Local database, uploaded HR documents, logs and backups
+data/
+outputs/
+*.db
+*.db-*
+*.sqlite*
+*.log
+
+# Local tooling
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.DS_Store
+Thumbs.db
