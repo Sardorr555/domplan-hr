@@ -98,6 +98,14 @@ async def stale_handler(request,exc):
     return JSONResponse(status_code=409,content={'detail':'Заявка изменена другим пользователем. Обновите страницу'})
 @app.middleware('http')
 async def headers(request,call_next):
+    parts=request.url.path.strip('/').split('/')
+    if request.method in ['POST','PUT','PATCH','DELETE'] and len(parts)>=3 and parts[:2]==['api','cases'] and parts[2].isdigit():
+        with DB() as db:
+            c=db.get(Case,int(parts[2]))
+            if c and json.loads(c.data).get('autonomous_demo') and not (request.method=='POST' and parts[3:]==['attachments']):
+                try:current(request,db)
+                except HTTPException as exc:return JSONResponse(status_code=exc.status_code,content={'detail':exc.detail})
+                return JSONResponse(status_code=409,content={'detail':'Эту учебную заявку выполняют агенты Swipies. Ручные изменения недоступны.'})
     response=await call_next(request)
     response.headers.update({'X-Content-Type-Options':'nosniff','X-Frame-Options':'DENY','Referrer-Policy':'same-origin','Cache-Control':'no-store','Content-Security-Policy':"default-src 'self'; style-src 'self'; script-src 'self'; frame-ancestors 'none'"})
     return response
@@ -284,7 +292,7 @@ def attachments(id:int,u=Depends(current),db:Session=Depends(database)):
 @app.post('/api/cases/{id}/attachments')
 async def attach(id:int,request:Request,u=Depends(current),db:Session=Depends(database)):
     c=getcase(db,u,id)
-    if u.role!='superadmin' and u.role!=c.state and not (u.role=='accountant' and c.state in ['payroll','calculated']): raise HTTPException(403,'Загрузка доступна ответственному текущего этапа')
+    if not (json.loads(c.data).get('autonomous_demo') and (u.id==c.owner or u.role=='superadmin')) and u.role!='superadmin' and u.role!=c.state and not (u.role=='accountant' and c.state in ['payroll','calculated']): raise HTTPException(403,'Загрузка доступна ответственному текущего этапа')
     name=Path(unquote(request.headers.get('x-filename','document.docx')).replace('\\','/')).name
     if len(name)>200 or Path(name).suffix.lower() not in ['.pdf','.docx','.txt']:raise HTTPException(422,'PDF, DOCX или TXT; имя до 200 символов')
     content=bytearray()

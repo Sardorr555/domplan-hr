@@ -9,7 +9,7 @@ from typing import Literal
 from sqlalchemy import select, Text, String
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Mapped, mapped_column
-from app.main import Base, DB, current, database, stamp, word_response
+from app.main import Base, DB, current, database, stamp, word_response, Case, Audit, Attachment, view
 
 STAGES=['manager','hr','ceo','accountant']
 NAMES={'manager':'ИИ · Руководитель','hr':'ИИ · HR','ceo':'ИИ · Директор','accountant':'ИИ · Бухгалтер'}
@@ -74,6 +74,25 @@ def save(id,stage,status,data):
     with DB() as db:
         r=db.get(DemoRun,id);r.stage=stage;r.status=status;r.updated=stamp();r.data=json.dumps(data,ensure_ascii=False)
         if status!='running':r.slot=None
+        if data.get('case_id'):
+            c=db.get(Case,data['case_id']);card=json.loads(c.data)
+            previous=card.get('ai_event_count',0)
+            for e in data['events'][previous:]:
+                db.add(Audit(actor=c.owner,case_id=c.id,action='ai_'+e['decision'],at=e['at'],detail=json.dumps({'ai_role':e['actor'],'stage':e['stage'],'conclusion':e['conclusion'],'comment':' • '.join(e['checks'])},ensure_ascii=False)))
+            card.update(ai_status=status,ai_stage=stage,ai_event_count=len(data['events']),ai_error=data.get('error'))
+            for key in ['payroll','payment']:
+                if key in data:card[key]=data[key]
+            c.state='paid' if status=='completed' else 'rejected' if status=='rejected' else stage if stage in STAGES else c.state
+            c.data=json.dumps(card,ensure_ascii=False)
+            from app.documents import build_workflow
+            history=[dict(at=e['at'],actor=e['actor'],action=e['decision'],detail=e['conclusion']+'\n'+'\n'.join(e['checks'])) for e in data['events']]
+            a=db.scalar(select(Attachment).where(Attachment.case_id==c.id,Attachment.name=='Swipies-workflow.docx'))
+            if a:a.content=build_workflow(view(c),history);a.at=stamp()
+            for event_index,e in enumerate(data['events'][previous:],start=previous+1):
+                snapshot_history=history[:event_index]
+                snapshot={**view(c),'state':e['stage']}
+                if e['decision']!='simulated_payment':snapshot.pop('payment',None);snapshot.pop('payroll',None)
+                db.add(Attachment(case_id=c.id,actor=c.owner,name=f"AI-step-{event_index}-{e['stage']}.docx",content=build_workflow(snapshot,snapshot_history)))
         db.commit()
 
 async def execute(id):
@@ -105,9 +124,23 @@ def recover():
     with DB() as db:
         for r in db.scalars(select(DemoRun).where(DemoRun.status=='running')):
             d=json.loads(r.data);d['error']='Сервер перезапущен. Для продолжения запустите новую демонстрацию.';r.data=json.dumps(d,ensure_ascii=False);r.status='interrupted';r.slot=None
+            if d.get('case_id'):
+                c=db.get(Case,d['case_id']);card=json.loads(c.data);card.update(ai_status='interrupted',ai_error=d['error']);c.data=json.dumps(card,ensure_ascii=False)
         db.commit()
 
 def register(app):
+    @app.post('/api/demo/cases')
+    def launch_case(tasks:BackgroundTasks,u=Depends(current),db=Depends(database)):
+        if not os.getenv('RAGFLOW_API_KEY'):raise HTTPException(503,'Не настроен ключ Swipies')
+        card=fictional();card['department']=u.department
+        c=Case(owner=u.id,department=u.department,data=json.dumps({**card,'documents':[], 'autonomous_demo':True,'ai_status':'running','ai_stage':'manager'},ensure_ascii=False));db.add(c);db.flush()
+        r=DemoRun(status='running',slot=1,stage='manager',data=json.dumps({'case_id':c.id,'card':card,'events':[]},ensure_ascii=False));db.add(r)
+        from app.documents import build_workflow
+        db.add(Attachment(case_id=c.id,actor=u.id,name='Swipies-workflow.docx',content=build_workflow(view(c))))
+        db.add(Audit(actor=u.id,case_id=c.id,action='ai_start',detail=json.dumps({'conclusion':'Запущены агенты Swipies. Все данные учебные; выплата только имитируется.'},ensure_ascii=False)))
+        try:db.commit()
+        except IntegrityError:db.rollback();raise HTTPException(409,'Агенты уже выполняют заявку. Дождитесь завершения.')
+        tasks.add_task(execute,r.id);return output(r)
     @app.get('/api/demo/runs')
     def runs(u=Depends(current),db=Depends(database)):
         return [output(r) for r in db.scalars(select(DemoRun).order_by(DemoRun.id.desc()).limit(20))]

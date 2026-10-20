@@ -256,3 +256,42 @@ def test_demo_uses_swipies_dialogue_contract(monkeypatch):
     answer=asyncio.run(demo.ask('test-chat','hr',demo.fictional(),[]))
     assert answer.decision=='approve' and answer.checks==['Комплект проверен']
     with pytest.raises(Exception):demo.parse_answer('not a decision')
+
+def test_agents_execute_in_original_case(monkeypatch):
+    from app import demo
+    monkeypatch.setenv('RAGFLOW_API_KEY','test')
+    async def assistant():return 'test-chat'
+    async def ask(chat,stage,card,events):
+        assert card['department']=='Operations'
+        return demo.Answer(decision='approve',conclusion='Учебные документы проверены агентом',checks=['Данные согласованы'])
+    monkeypatch.setattr(demo,'assistant',assistant);monkeypatch.setattr(demo,'ask',ask)
+    c=client('manager');r=c.post('/api/demo/cases');assert r.status_code==200,r.text
+    id=r.json()['case_id'];case=c.get('/api/cases').json()[0]
+    assert case['id']==id and case['state']=='paid' and case['ai_status']=='completed'
+    assert case['payment']['simulated'] is True and case['payroll']['net']=='10500.00'
+    hist=c.get(f'/api/cases/{id}/history').json()
+    assert len([e for e in hist if e['action']=='ai_approve'])==4
+    assert all(e['detail'].get('ai_role') for e in hist if e['action']=='ai_approve')
+    assert c.post(f'/api/cases/{id}/payment',json={}).status_code==409
+    files=c.get(f'/api/cases/{id}/attachments').json();assert len(files)==6
+    assert len([f for f in files if f['name'].startswith('AI-step-')])==5
+    upload=c.post(f'/api/cases/{id}/attachments',content=b'Updated fictional document',headers={'X-Filename':'revision.txt'})
+    assert upload.status_code==200
+    assert len(c.get(f'/api/cases/{id}/attachments').json())==7
+    doc=c.get(f"/api/cases/{id}/attachments/{files[0]['id']}/download")
+    assert doc.status_code==200 and doc.content[:2]==b'PK'
+    assert client('other').get('/api/cases').json()==[]
+
+def test_linked_agent_failure_and_rejection(monkeypatch):
+    from app import demo
+    monkeypatch.setenv('RAGFLOW_API_KEY','test')
+    async def assistant():return 'test'
+    async def reject(*args):return demo.Answer(decision='reject',conclusion='Учебный комплект отклонён',checks=[])
+    monkeypatch.setattr(demo,'assistant',assistant);monkeypatch.setattr(demo,'ask',reject)
+    c=client('manager');assert c.post('/api/demo/cases').status_code==200
+    case=c.get('/api/cases').json()[0];assert case['state']=='rejected' and 'payment' not in case
+    assert TestClient(m.app).post(f"/api/cases/{case['id']}/decision",json={}).status_code==401
+    async def failure(*args):raise RuntimeError('remote unavailable')
+    monkeypatch.setattr(demo,'ask',failure)
+    assert c.post('/api/demo/cases').status_code==200
+    case=c.get('/api/cases').json()[0];assert case['ai_status']=='error' and 'payment' not in case
