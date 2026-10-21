@@ -289,8 +289,8 @@ def test_agents_execute_in_original_case(monkeypatch):
     files=c.get(f'/api/cases/{id}/attachments').json();assert len(files)==6
     assert len([f for f in files if f['name'].startswith('AI-step-')])==5
     upload=c.post(f'/api/cases/{id}/attachments',content=b'Updated fictional document',headers={'X-Filename':'revision.txt'})
-    assert upload.status_code==200
-    assert len(c.get(f'/api/cases/{id}/attachments').json())==7
+    assert upload.status_code==409
+    assert len(c.get(f'/api/cases/{id}/attachments').json())==6
     doc=c.get(f"/api/cases/{id}/attachments/{files[0]['id']}/download")
     assert doc.status_code==200 and doc.content[:2]==b'PK'
     assert client('other').get('/api/cases').json()==[]
@@ -351,3 +351,54 @@ def test_human_can_stop_before_any_handoff(monkeypatch):
     r=c.post(f"/api/demo/runs/{run['id']}/confirm",json={'token':run['pending']['token'],'action':'reject','comment':'Нужны исправления'})
     assert r.status_code==200
     case=c.get('/api/cases').json()[0];assert case['ai_status']=='rejected' and 'payment' not in case
+
+
+def test_upload_edit_reanalyze_and_invalidate_confirmation(monkeypatch):
+    from app import demo
+    monkeypatch.setenv('RAGFLOW_API_KEY','test')
+    received=[]
+    async def assistant():return 'test'
+    async def ask(chat,stage,card,events):
+        received.append((stage,list(card['documents'])))
+        return demo.Answer(decision='approve',conclusion='Новая версия проверена агентом',checks=['Текст прочитан'])
+    monkeypatch.setattr(demo,'assistant',assistant);monkeypatch.setattr(demo,'ask',ask)
+    c=client('manager');r=c.post('/api/demo/cases/draft');assert r.status_code==200
+    run=r.json();id=run['id'];cid=run['case_id'];assert run['status']=='waiting_document' and not received
+    token=run['revision_token']
+    bad=client('hr').post(f'/api/demo/runs/{id}/revision',json={'token':token,'text':'Wrong role revision'})
+    assert bad.status_code==403 and not received
+    from docx import Document
+    from io import BytesIO
+    d=Document();d.add_paragraph('Учебный документ пользователя: первая версия');t=d.add_table(rows=1,cols=1);t.cell(0,0).text='Условия в таблице'
+    out=BytesIO();d.save(out)
+    r=c.post(f'/api/demo/runs/{id}/revision-file',content=out.getvalue(),headers={'X-Filename':'human.docx','X-Revision-Token':token});assert r.status_code==200,r.text
+    assert len(received)==1 and 'Условия в таблице' in received[-1][1][0]
+    run=c.get('/api/demo/runs').json()[0];old=run['pending']['token'];assert run['status']=='waiting_confirmation'
+    r=c.post(f'/api/demo/runs/{id}/revision',json={'token':old,'text':'Учебный документ: исправленная вторая версия'});assert r.status_code==200,r.text
+    assert len(received)==2 and received[-1][0]=='manager' and 'вторая версия' in received[-1][1][0]
+    run=c.get('/api/demo/runs').json()[0];assert run['pending']['token']!=old
+    assert c.post(f'/api/demo/runs/{id}/confirm',json={'token':old,'action':'approve'}).status_code==409
+    assert c.post(f'/api/demo/runs/{id}/revision',json={'token':old,'text':'Повтор устаревшего изменения'}).status_code==409
+    files=c.get(f'/api/cases/{cid}/attachments').json();assert len(files)==3
+    original=next(f for f in files if f['name']=='human.docx')
+    assert c.get(f"/api/cases/{cid}/attachments/{original['id']}/download").content==out.getvalue()
+    history=c.get(f'/api/cases/{cid}/history').json();assert len([a for a in history if a['action']=='document_revision'])==2
+    assert not any(a['action']=='human_confirm' for a in history)
+    case=c.get('/api/cases').json()[0];assert 'вторая версия' in case['ai_document_text'] and 'payment' not in case
+    assert c.post(f'/api/demo/runs/{id}/revision-file',content=b'invalid docx',headers={'X-Filename':'broken.docx','X-Revision-Token':run['pending']['token']}).status_code==422
+    assert c.get('/api/demo/runs').json()[0]['pending']['token']==run['pending']['token']
+
+def test_revision_at_hr_restarts_all_reviews(monkeypatch):
+    from app import demo
+    monkeypatch.setenv('RAGFLOW_API_KEY','test')
+    async def assistant():return 'test'
+    async def ask(*args):return demo.Answer(decision='approve',conclusion='Учебная версия проверена',checks=[])
+    monkeypatch.setattr(demo,'assistant',assistant);monkeypatch.setattr(demo,'ask',ask)
+    manager=client('manager');manager.post('/api/demo/cases');run=manager.get('/api/demo/runs').json()[0];id=run['id']
+    assert manager.post(f'/api/demo/runs/{id}/confirm',json={'token':run['pending']['token'],'action':'approve'}).status_code==200
+    hr=client('hr');run=hr.get('/api/demo/runs').json()[0];assert run['stage']=='hr'
+    old=run['pending']['token']
+    assert hr.post(f'/api/demo/runs/{id}/revision',json={'token':old,'text':'Исправленная учебная версия на этапе HR'}).status_code==200
+    run=hr.get('/api/demo/runs').json()[0];assert run['stage']=='manager' and len(run['events'])==0 and len(run['archived_events'])==1
+    assert hr.post(f'/api/demo/runs/{id}/confirm',json={'token':old,'action':'approve'}).status_code==403
+    result=confirm_demo_until_finished();assert result['status']=='completed' and len([e for e in result['events'] if e['decision']=='approve'])==4

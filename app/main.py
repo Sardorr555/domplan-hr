@@ -102,7 +102,7 @@ async def headers(request,call_next):
     if request.method in ['POST','PUT','PATCH','DELETE'] and len(parts)>=3 and parts[:2]==['api','cases'] and parts[2].isdigit():
         with DB() as db:
             c=db.get(Case,int(parts[2]))
-            if c and json.loads(c.data).get('autonomous_demo') and not (request.method=='POST' and parts[3:]==['attachments']):
+            if c and json.loads(c.data).get('autonomous_demo'):
                 try:current(request,db)
                 except HTTPException as exc:return JSONResponse(status_code=exc.status_code,content={'detail':exc.detail})
                 return JSONResponse(status_code=409,content={'detail':'Эту учебную заявку выполняют агенты Swipies. Ручные изменения недоступны.'})

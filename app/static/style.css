@@ -7,3 +7,5 @@
 .stage-details{margin:20px 0}.stage-details details{border:1px solid #d7e5dd;border-radius:10px;margin:12px 0;padding:16px;background:#f7faf8}.stage-details summary{cursor:pointer;font-weight:600;color:#235a47}.stage-details a{display:inline-block;margin:8px 0}
 
 .human-review{background:#fff8e8;border:1px solid #e4c778;border-radius:14px;padding:22px;margin:20px 0}.human-review h3{color:#785413;margin-top:0}.human-review form{margin-top:18px}.final-outcome{border:1px solid #cfe1d6;background:#f5faf7;border-radius:14px;padding:20px;margin:20px 0}.final-outcome a{display:inline-block;margin:12px 0}.agent-node.is-paused .agent-state{color:#895d12}
+
+.document-editor{background:white;border:1px solid #d8e2db;padding:20px;border-radius:12px;margin-bottom:24px}.document-editor textarea{min-height:240px;resize:vertical}.document-editor form+form{border-top:1px solid #d8e2db;margin-top:24px;padding-top:20px}
