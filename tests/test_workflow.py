@@ -206,6 +206,16 @@ def test_ragflow_failure_preserves_local_attachment(monkeypatch):
     assert c.post(f'/api/cases/{cid}/attachments/{a["id"]}/analyze').status_code==502
     assert c.get(f'/api/cases/{cid}/attachments/{a["id"]}/download').content==b'local data'
 
+
+def confirm_demo_until_finished():
+    admin=client('superadmin')
+    for _ in range(15):
+        run=admin.get('/api/demo/runs').json()[0]
+        if run['status']!='waiting_confirmation':return run
+        response=admin.post(f"/api/demo/runs/{run['id']}/confirm",json={'token':run['pending']['token'],'action':'approve','comment':'Проверено человеком'})
+        assert response.status_code==200,response.text
+    raise AssertionError('Too many approvals')
+
 def test_demo_autonomous_route_is_synthetic_and_separate(monkeypatch):
     from app import demo
     monkeypatch.setenv('RAGFLOW_API_KEY','test-key')
@@ -217,7 +227,8 @@ def test_demo_autonomous_route_is_synthetic_and_separate(monkeypatch):
     monkeypatch.setattr(demo,'assistant',assistant);monkeypatch.setattr(demo,'ask',ask)
     c=client('superadmin');r=c.post('/api/demo/runs',json={'name':'This must be ignored','case_id':1})
     assert r.status_code==200
-    run=c.get('/api/demo/runs').json()[0]
+    waiting=c.get('/api/demo/runs').json()[0];assert waiting['status']=='waiting_confirmation' and calls==['manager']
+    run=confirm_demo_until_finished()
     assert run['status']=='completed' and calls==demo.STAGES
     assert run['payroll']['net']=='10500.00' and run['payment']['simulated'] is True
     assert c.get('/api/cases').json()==[]
@@ -230,7 +241,7 @@ def test_demo_reject_and_upstream_failure(monkeypatch):
     async def reject(*args):return demo.Answer(decision='reject',conclusion='Симуляция отклонения',checks=[])
     monkeypatch.setattr(demo,'assistant',assistant);monkeypatch.setattr(demo,'ask',reject)
     c=client('hr');assert c.post('/api/demo/runs').status_code==200
-    assert c.get('/api/demo/runs').json()[0]['status']=='rejected'
+    assert confirm_demo_until_finished()['status']=='rejected'
     async def fail(*args):raise RuntimeError('upstream')
     monkeypatch.setattr(demo,'ask',fail);assert c.post('/api/demo/runs').status_code==200
     assert c.get('/api/demo/runs').json()[0]['status']=='error'
@@ -243,7 +254,7 @@ def test_demo_return_loop_is_bounded_and_needs_auth(monkeypatch):
     monkeypatch.setattr(demo,'assistant',assistant);monkeypatch.setattr(demo,'ask',returns)
     assert TestClient(m.app).post('/api/demo/runs').status_code==401
     c=client('ceo');assert c.post('/api/demo/runs').status_code==200
-    run=c.get('/api/demo/runs').json()[0];assert run['status']=='stopped' and len(run['events'])==12
+    run=confirm_demo_until_finished();assert run['status']=='stopped' and len(run['events'])==12
 
 def test_demo_uses_swipies_dialogue_contract(monkeypatch):
     import asyncio
@@ -266,6 +277,8 @@ def test_agents_execute_in_original_case(monkeypatch):
         return demo.Answer(decision='approve',conclusion='Учебные документы проверены агентом',checks=['Данные согласованы'])
     monkeypatch.setattr(demo,'assistant',assistant);monkeypatch.setattr(demo,'ask',ask)
     c=client('manager');r=c.post('/api/demo/cases');assert r.status_code==200,r.text
+    assert c.get('/api/cases').json()[0]['ai_status']=='waiting_confirmation'
+    confirm_demo_until_finished()
     id=r.json()['case_id'];case=c.get('/api/cases').json()[0]
     assert case['id']==id and case['state']=='paid' and case['ai_status']=='completed'
     assert case['payment']['simulated'] is True and case['payroll']['net']=='10500.00'
@@ -289,9 +302,52 @@ def test_linked_agent_failure_and_rejection(monkeypatch):
     async def reject(*args):return demo.Answer(decision='reject',conclusion='Учебный комплект отклонён',checks=[])
     monkeypatch.setattr(demo,'assistant',assistant);monkeypatch.setattr(demo,'ask',reject)
     c=client('manager');assert c.post('/api/demo/cases').status_code==200
+    confirm_demo_until_finished()
     case=c.get('/api/cases').json()[0];assert case['state']=='rejected' and 'payment' not in case
     assert TestClient(m.app).post(f"/api/cases/{case['id']}/decision",json={}).status_code==401
     async def failure(*args):raise RuntimeError('remote unavailable')
     monkeypatch.setattr(demo,'ask',failure)
     assert c.post('/api/demo/cases').status_code==200
     case=c.get('/api/cases').json()[0];assert case['ai_status']=='error' and 'payment' not in case
+
+
+def test_confirmation_rbac_replay_and_final_bundle(monkeypatch):
+    from app import demo
+    monkeypatch.setenv('RAGFLOW_API_KEY','test')
+    calls=[]
+    async def assistant():return 'test'
+    async def ask(chat,stage,*args):
+        calls.append(stage)
+        return demo.Answer(decision='approve',conclusion='Документ проверен агентом',checks=['Комплект полный'])
+    monkeypatch.setattr(demo,'assistant',assistant);monkeypatch.setattr(demo,'ask',ask)
+    manager=client('manager');r=manager.post('/api/demo/cases');assert r.status_code==200
+    run=manager.get('/api/demo/runs').json()[0];id=run['id'];caseid=run['case_id']
+    assert run['status']=='waiting_confirmation' and calls==['manager']
+    assert 'payment' not in manager.get('/api/cases').json()[0]
+    payload={'token':run['pending']['token'],'action':'approve'}
+    assert client('hr').post(f'/api/demo/runs/{id}/confirm',json=payload).status_code==403
+    demo.recover()
+    assert manager.get('/api/demo/runs').json()[0]['status']=='waiting_confirmation'
+    assert manager.post(f'/api/demo/runs/{id}/confirm',json=payload).status_code==200
+    assert calls==['manager','hr']
+    assert client('superadmin').post(f'/api/demo/runs/{id}/confirm',json=payload).status_code==409
+    confirm_demo_until_finished()
+    result=manager.get('/api/cases').json()[0];assert result['ai_status']=='completed' and result['payment']['simulated']
+    hist=manager.get(f'/api/cases/{caseid}/history').json()
+    assert len([e for e in hist if e['action']=='human_confirm'])==4
+    bundle=manager.get(f'/api/demo/cases/{caseid}/documents.zip');assert bundle.status_code==200
+    from zipfile import ZipFile
+    from io import BytesIO
+    with ZipFile(BytesIO(bundle.content)) as archive:assert 'Final-workflow.docx' in archive.namelist() and len(archive.namelist())==7
+    assert client('other').get(f'/api/demo/cases/{caseid}/documents.zip').status_code==404
+
+def test_human_can_stop_before_any_handoff(monkeypatch):
+    from app import demo
+    monkeypatch.setenv('RAGFLOW_API_KEY','test')
+    async def assistant():return 'test'
+    async def ask(*args):return demo.Answer(decision='approve',conclusion='Документы проверены',checks=[])
+    monkeypatch.setattr(demo,'assistant',assistant);monkeypatch.setattr(demo,'ask',ask)
+    c=client('manager');c.post('/api/demo/cases');run=c.get('/api/demo/runs').json()[0]
+    r=c.post(f"/api/demo/runs/{run['id']}/confirm",json={'token':run['pending']['token'],'action':'reject','comment':'Нужны исправления'})
+    assert r.status_code==200
+    case=c.get('/api/cases').json()[0];assert case['ai_status']=='rejected' and 'payment' not in case

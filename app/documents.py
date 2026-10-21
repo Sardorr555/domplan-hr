@@ -15,6 +15,11 @@ def build_workflow(case=None, history=None, attachments=None):
     d.add_heading('Приём сотрудника и первая зарплата',0)
     d.add_paragraph('Единая маршрутная карточка • '+('Заявка № '+str(case['id']) if case else 'Шаблон для заполнения'))
     d.add_paragraph('Руководитель → HR → Директор → Бухгалтерия → Расчёт → Запись выплаты')
+    if case and case.get('autonomous_demo'):
+        d.add_paragraph('УЧЕБНАЯ СИМУЛЯЦИЯ. Реальный приём и банковский перевод не выполнялись.')
+        if case.get('ai_pending'):
+            proposal=case['ai_pending'];d.add_heading('Ожидается подтверждение человека',1);d.add_paragraph(proposal['conclusion'])
+            for check in proposal['checks']:d.add_paragraph(check)
     if case:d.add_paragraph('Текущий этап: '+TITLES.get(case['state'],case['state'])+' | Версия: '+str(case['version']))
     def table(rows):
         t=d.add_table(rows=0,cols=2);t.style='Light Shading Accent 1'

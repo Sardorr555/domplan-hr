@@ -1,15 +1,15 @@
 """Autonomous simulation. Only server-generated fictional data enters the model."""
-import json, os, re
+import json, os, re, secrets
 from decimal import Decimal
 from io import BytesIO
 import httpx
 from fastapi import BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel, Field
 from typing import Literal
-from sqlalchemy import select, Text, String
+from sqlalchemy import select, update, Text, String
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Mapped, mapped_column
-from app.main import Base, DB, current, database, stamp, word_response, Case, Audit, Attachment, view
+from app.main import Base, DB, current, database, stamp, word_response, Case, Audit, Attachment, view, getcase, require
 
 STAGES=['manager','hr','ceo','accountant']
 NAMES={'manager':'ИИ · Руководитель','hr':'ИИ · HR','ceo':'ИИ · Директор','accountant':'ИИ · Бухгалтер'}
@@ -73,13 +73,13 @@ async def ask(chat,stage,card,events):
 def save(id,stage,status,data):
     with DB() as db:
         r=db.get(DemoRun,id);r.stage=stage;r.status=status;r.updated=stamp();r.data=json.dumps(data,ensure_ascii=False)
-        if status!='running':r.slot=None
+        if status not in ['running','waiting_confirmation']:r.slot=None
         if data.get('case_id'):
             c=db.get(Case,data['case_id']);card=json.loads(c.data)
             previous=card.get('ai_event_count',0)
             for e in data['events'][previous:]:
                 db.add(Audit(actor=c.owner,case_id=c.id,action='ai_'+e['decision'],at=e['at'],detail=json.dumps({'ai_role':e['actor'],'stage':e['stage'],'conclusion':e['conclusion'],'comment':' • '.join(e['checks'])},ensure_ascii=False)))
-            card.update(ai_status=status,ai_stage=stage,ai_event_count=len(data['events']),ai_error=data.get('error'))
+            card.update(ai_run_id=id,ai_pending=data.get('pending'),ai_status=status,ai_stage=stage,ai_event_count=len(data['events']),ai_error=data.get('error'))
             for key in ['payroll','payment']:
                 if key in data:card[key]=data[key]
             c.state='paid' if status=='completed' else 'rejected' if status=='rejected' else stage if stage in STAGES else c.state
@@ -96,29 +96,41 @@ def save(id,stage,status,data):
         db.commit()
 
 async def execute(id):
-    with DB() as db:data=json.loads(db.get(DemoRun,id).data)
-    stage='manager'
+    with DB() as db:
+        run=db.get(DemoRun,id)
+        if not run or run.status!='running':return
+        data=json.loads(run.data);stage=run.stage
     try:
-        chat=await assistant();index=0
-        for step in range(12):
-            stage=STAGES[index];save(id,stage,'running',data)
-            answer=await ask(chat,stage,data['card'],data['events'])
+        if data.pop('human_rejected',False):
+            data.pop('pending',None);save(id,stage,'rejected',data);return
+        proposal=data.pop('confirmed',None)
+        index=STAGES.index(stage)
+        if proposal:
+            answer=Answer.model_validate(proposal)
             data['events'].append({'stage':stage,'actor':NAMES[stage],'decision':answer.decision,'conclusion':answer.conclusion,'checks':answer.checks,'at':stamp()})
             if answer.decision=='reject':save(id,stage,'rejected',data);return
-            if answer.decision=='return':
-                index=max(0,index-1);save(id,STAGES[index],'running',data);continue
-            index+=1
+            if answer.decision=='return':index=max(0,index-1)
+            else:index+=1
             if index==len(STAGES):
                 p=data['card']['payroll_input'];gross=(Decimal(data['card']['salary'])*Decimal(p['worked_days'])/Decimal(p['scheduled_days'])+Decimal(p['bonus'])).quantize(Decimal('.01'))
                 data['payroll']={**p,'gross':str(gross),'net':str(gross-Decimal(p['deduction']))}
                 data['payment']={'reference':'DEMO-SIMULATION-'+str(id),'paid_on':p['payment_due'],'simulated':True}
-                data['events'].append({'stage':'accountant','actor':NAMES['accountant'],'decision':'simulated_payment','conclusion':'Демонстрационный расчёт завершён. Записана только имитация выплаты; деньги не переводились.','checks':['Начислено: '+str(gross),'К выплате: '+data['payroll']['net']],'at':stamp()})
+                data['events'].append({'stage':'accountant','actor':NAMES['accountant'],'decision':'simulated_payment','conclusion':'Учебный приём согласован человеком на всех этапах. Выплата только имитирована; деньги не переводились.','checks':['Начислено: '+str(gross),'К выплате: '+data['payroll']['net']],'at':stamp()})
                 save(id,'completed','completed',data);return
-            save(id,STAGES[index],'running',data)
-        data['error']='Достигнут предел повторных проверок. Запустите новую демонстрацию.';save(id,stage,'stopped',data)
+        if len(data['events'])>=12:
+            data['error']='Достигнут предел повторных проверок.';save(id,stage,'stopped',data);return
+        stage=STAGES[index];save(id,stage,'running',data)
+        chat=await assistant();answer=await ask(chat,stage,data['card'],data['events'])
+        data['pending']={**answer.model_dump(),'token':secrets.token_urlsafe(24),'stage':stage,'at':stamp()}
+        save(id,stage,'waiting_confirmation',data)
     except Exception:
-        data['error']='Не удалось получить корректное решение Swipies. Проверьте доступность модели и подключение, затем запустите демонстрацию заново.'
+        data['error']='Не удалось получить корректное решение Swipies. Проверьте подключение и доступность модели.'
         save(id,stage,'error',data)
+
+class Confirmation(BaseModel):
+    token:str=Field(min_length=10,max_length=100)
+    action:Literal['approve','reject']
+    comment:str=Field(default='',max_length=2000)
 
 def recover():
     with DB() as db:
@@ -134,20 +146,51 @@ def register(app):
         if not os.getenv('RAGFLOW_API_KEY'):raise HTTPException(503,'Не настроен ключ Swipies')
         card=fictional();card['department']=u.department
         c=Case(owner=u.id,department=u.department,data=json.dumps({**card,'documents':[], 'autonomous_demo':True,'ai_status':'running','ai_stage':'manager'},ensure_ascii=False));db.add(c);db.flush()
-        r=DemoRun(status='running',slot=1,stage='manager',data=json.dumps({'case_id':c.id,'card':card,'events':[]},ensure_ascii=False));db.add(r)
+        r=DemoRun(status='running',slot=1,stage='manager',data=json.dumps({'case_id':c.id,'owner_id':u.id,'card':card,'events':[]},ensure_ascii=False));db.add(r)
         from app.documents import build_workflow
         db.add(Attachment(case_id=c.id,actor=u.id,name='Swipies-workflow.docx',content=build_workflow(view(c))))
         db.add(Audit(actor=u.id,case_id=c.id,action='ai_start',detail=json.dumps({'conclusion':'Запущены агенты Swipies. Все данные учебные; выплата только имитируется.'},ensure_ascii=False)))
         try:db.commit()
         except IntegrityError:db.rollback();raise HTTPException(409,'Агенты уже выполняют заявку. Дождитесь завершения.')
         tasks.add_task(execute,r.id);return output(r)
+    @app.post('/api/demo/runs/{id}/confirm')
+    def confirm(id:int,p:Confirmation,tasks:BackgroundTasks,u=Depends(current),db=Depends(database)):
+        r=db.get(DemoRun,id)
+        if not r:raise HTTPException(404,'Запуск не найден')
+        data=json.loads(r.data)
+        if data.get('case_id'):getcase(db,u,data['case_id'])
+        require(u,r.stage)
+        pending=data.get('pending')
+        if r.status!='waiting_confirmation' or not pending or not secrets.compare_digest(p.token,pending['token']):raise HTTPException(409,'Решение уже подтверждено или изменилось. Обновите карточку.')
+        before=r.data;proposal=data.pop('pending')
+        if p.action=='approve':data['confirmed']={k:proposal[k] for k in ['decision','conclusion','checks']}
+        else:data['human_rejected']=True
+        changed=db.execute(update(DemoRun).where(DemoRun.id==id,DemoRun.status=='waiting_confirmation',DemoRun.data==before).values(status='running',data=json.dumps(data,ensure_ascii=False),updated=stamp()).execution_options(synchronize_session=False))
+        if changed.rowcount!=1:db.rollback();raise HTTPException(409,'Решение уже обработано')
+        if data.get('case_id'):
+            db.add(Audit(actor=u.id,case_id=data['case_id'],action='human_confirm' if p.action=='approve' else 'human_reject',detail=json.dumps({'stage':r.stage,'conclusion':proposal['conclusion'],'comment':p.comment or ('Передача подтверждена человеком' if p.action=='approve' else 'Процесс остановлен человеком')},ensure_ascii=False)))
+        db.commit();tasks.add_task(execute,id);return {'status':'running'}
+    @app.get('/api/demo/cases/{id}/documents.zip')
+    def bundle(id:int,u=Depends(current),db=Depends(database)):
+        from zipfile import ZipFile, ZIP_DEFLATED
+        from fastapi.responses import Response
+        from app.documents import build_workflow
+        c=getcase(db,u,id);files=list(db.scalars(select(Attachment).where(Attachment.case_id==id)))
+        history=[dict(at=a.at,actor=str(a.actor),action=a.action,detail=a.detail) for a in db.scalars(select(Audit).where(Audit.case_id==id).order_by(Audit.id))]
+        out=BytesIO()
+        with ZipFile(out,'w',ZIP_DEFLATED) as archive:
+            archive.writestr('Final-workflow.docx',build_workflow(view(c),history,[dict(name=a.name,at=a.at) for a in files]))
+            for a in files:
+                from pathlib import Path
+                archive.writestr(str(a.id)+'-'+Path(a.name.replace('\\','/')).name,a.content)
+        return Response(out.getvalue(),media_type='application/zip',headers={'Content-Disposition':f'attachment; filename="domplan-{id}-documents.zip"'})
     @app.get('/api/demo/runs')
     def runs(u=Depends(current),db=Depends(database)):
         return [output(r) for r in db.scalars(select(DemoRun).order_by(DemoRun.id.desc()).limit(20))]
     @app.post('/api/demo/runs')
     def launch(tasks:BackgroundTasks,u=Depends(current),db=Depends(database)):
         if not os.getenv('RAGFLOW_API_KEY'):raise HTTPException(503,'Не настроен ключ Swipies')
-        r=DemoRun(status='running',slot=1,stage='manager',data=json.dumps({'card':fictional(),'events':[]},ensure_ascii=False));db.add(r)
+        r=DemoRun(status='running',slot=1,stage='manager',data=json.dumps({'owner_id':u.id,'card':fictional(),'events':[]},ensure_ascii=False));db.add(r)
         try:db.commit()
         except IntegrityError:db.rollback();raise HTTPException(409,'Демонстрация уже выполняется. Дождитесь завершения.')
         tasks.add_task(execute,r.id);return output(r)
